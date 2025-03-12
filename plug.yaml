@@ -1,0 +1,16 @@
+services:
+  - name: Docker
+    enabled: true
+    tools:
+      - name: create_network
+        enabled: true
+        description: "Create a Docker network"
+        schema:
+          type: object
+          properties:
+            name:
+              type: string
+              description: "Name of the network"
+          required:
+            - name
+        plugin: "github.com/santoshkal/plug"

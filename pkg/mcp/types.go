@@ -1,11 +1,11 @@
 // ./pkg/mcp/types.go
-
 package mcp
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
+
+	"github.com/santoshkal/gomcp/pkg/plugins"
 )
 
 const JSONRPCVersion = "2.0"
@@ -32,13 +32,6 @@ type RPCError struct {
 	Message string `json:"message"`
 }
 
-// RPCErrorResponse is another form of error response.
-type RPCErrorResponse struct {
-	Version  string   `json:"jsonrpc"`
-	ErrorObj RPCError `json:"error"`
-	ID       *int     `json:"id"`
-}
-
 // NewError creates a new RPCError with the given code and message.
 func NewError(code int, msg string) *RPCError {
 	return &RPCError{
@@ -58,10 +51,7 @@ type ToolCallArgs struct {
 	Parameters map[string]interface{} `json:"parameters"`
 }
 
-// ToolHandler is the function signature for tool handlers.
-type ToolHandler func(ctx context.Context, reg Registry, parameters map[string]interface{}) error
-
 // Registry defines the interface for registering tools.
 type Registry interface {
-	RegisterTool(name, description string, inputSchema map[string]interface{}, handler ToolHandler)
+	RegisterTool(name, description string, inputSchema map[string]interface{}, handler plugins.ToolHandler)
 }

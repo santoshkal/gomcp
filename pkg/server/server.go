@@ -1,3 +1,4 @@
+// ./pkg/server/server.go
 package server
 
 import (
@@ -13,12 +14,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/client"
 	"github.com/sirupsen/logrus"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/openai"
 
 	"github.com/santoshkal/gomcp/pkg/mcp"
+	"github.com/santoshkal/gomcp/pkg/plugins"
 	"github.com/santoshkal/gomcp/pkg/reg"
 	"github.com/santoshkal/gomcp/pkg/utils"
 )
@@ -39,7 +40,7 @@ type RegisteredTool struct {
 	Name        string
 	Description string
 	InputSchema map[string]interface{}
-	Handler     mcp.ToolHandler
+	Handler     plugins.ToolHandler
 	ServiceName string
 }
 
@@ -50,11 +51,11 @@ type Service interface {
 }
 
 // Server represents the composite server and implements mcp.Registry.
+// It is now completely independent of any technology-specific code.
 type Server struct {
-	dockerClient *client.Client
-	llm          *openai.LLM
-	tools        map[string]RegisteredTool
-	services     map[string]Service
+	llm      *openai.LLM
+	tools    map[string]RegisteredTool
+	services map[string]Service
 }
 
 // Ensure Server implements mcp.Registry.
@@ -64,12 +65,6 @@ var _ mcp.Registry = (*Server)(nil)
 func NewServer() (*Server, error) {
 	logger.Debug("Entering NewServer")
 	defer logger.Debug("Exiting NewServer")
-
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		logger.Errorf("Docker client initialization failed: %v", err)
-		dockerClient = nil // Allow server initialization without Docker.
-	}
 
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
@@ -81,15 +76,14 @@ func NewServer() (*Server, error) {
 	}
 
 	s := &Server{
-		dockerClient: dockerClient,
-		llm:          llm,
-		tools:        make(map[string]RegisteredTool),
-		services:     make(map[string]Service),
+		llm:      llm,
+		tools:    make(map[string]RegisteredTool),
+		services: make(map[string]Service),
 	}
 
 	// Dynamically load and register tools from YAML configuration.
 	homeDir := os.Getenv("HOME")
-	configPath := homeDir + "/mcp-godocker/plug.yaml"
+	configPath := homeDir + "/gomcp/plug.yaml"
 	logger.Infof("Config Path: %v", configPath)
 	if configPath == "" {
 		configPath = "plug.yaml" // Default configuration file.
@@ -103,7 +97,7 @@ func NewServer() (*Server, error) {
 }
 
 // RegisterTool implements the mcp.Registry interface.
-func (s *Server) RegisterTool(name, description string, inputSchema map[string]interface{}, handler mcp.ToolHandler) {
+func (s *Server) RegisterTool(name, description string, inputSchema map[string]interface{}, handler plugins.ToolHandler) {
 	logger.Debugf("Registering tool: %s", name)
 	s.tools[name] = RegisteredTool{
 		Name:        name,
@@ -205,11 +199,6 @@ func (s *Server) ProcessInstruction(instruction *string, reply *mcp.RPCResponse)
 	return nil
 }
 
-// DockerClient returns the Docker client instance.
-func (s *Server) DockerClient() *client.Client {
-	return s.dockerClient
-}
-
 // invokeTool executes a tool based on the LLM function call.
 func (s *Server) invokeTool(functionCall *llms.FunctionCall) (string, error) {
 	logger.Debugf("Entering invokeTool for function: %s", functionCall.Name)
@@ -228,11 +217,12 @@ func (s *Server) invokeTool(functionCall *llms.FunctionCall) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := tool.Handler(ctx, s, params); err != nil {
+	result, err := tool.Handler(ctx, params)
+	if err != nil {
 		return "", fmt.Errorf("error executing tool %s: %v", functionCall.Name, err)
 	}
 
-	return fmt.Sprintf("Tool %s executed successfully", functionCall.Name), nil
+	return fmt.Sprintf("Tool %s executed successfully, result: %v", functionCall.Name, result), nil
 }
 
 // CallLLM sends input to the LLM and returns a generated JSON plan.
@@ -345,7 +335,7 @@ func (s *Server) ExecutePlan(planJSON *string, reply *mcp.RPCResponse) error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	for _, action := range plan {
@@ -362,11 +352,13 @@ func (s *Server) ExecutePlan(planJSON *string, reply *mcp.RPCResponse) error {
 
 		parameters, _ := action["parameters"].(map[string]interface{})
 		if tool, exists := s.tools[actionType]; exists {
-			if err := tool.Handler(ctx, s, parameters); err != nil {
+			result, err := tool.Handler(context.Background(), parameters)
+			if err != nil {
 				response.Error = mcp.NewError(-32000, fmt.Sprintf("failed to execute tool %s: %v", actionType, err))
 				*reply = response
 				return nil
 			}
+			logger.Debugf("[ExecutePlan] Tool %s result: %v", actionType, result)
 		} else {
 			response.Error = mcp.NewError(-32601, fmt.Sprintf("unknown action: %s", actionType))
 			*reply = response
@@ -374,14 +366,14 @@ func (s *Server) ExecutePlan(planJSON *string, reply *mcp.RPCResponse) error {
 		}
 	}
 
-	result, err := json.Marshal(map[string]string{
+	resultJSON, err := json.Marshal(map[string]interface{}{
 		"status":  "success",
 		"message": "Plan executed successfully",
 	})
 	if err != nil {
 		response.Error = mcp.NewError(-32000, fmt.Sprintf("failed to marshal result: %v", err))
 	} else {
-		response.Result = json.RawMessage(result)
+		response.Result = json.RawMessage(resultJSON)
 	}
 	*reply = response
 	return nil
@@ -403,20 +395,22 @@ func (s *Server) CallTool(args *mcp.ToolCallArgs, reply *mcp.RPCResponse) error 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := tool.Handler(ctx, s, args.Parameters); err != nil {
+	result, err := tool.Handler(ctx, args.Parameters)
+	if err != nil {
 		response.Error = mcp.NewError(-32000, fmt.Sprintf("failed to execute tool %s: %v", args.ToolName, err))
 		*reply = response
 		return nil
 	}
 
-	result, err := json.Marshal(map[string]string{
+	resultJSON, err := json.Marshal(map[string]interface{}{
 		"status":  "success",
 		"message": fmt.Sprintf("Tool %s executed successfully", args.ToolName),
+		"result":  result,
 	})
 	if err != nil {
 		response.Error = mcp.NewError(-32000, fmt.Sprintf("failed to marshal result: %v", err))
 	} else {
-		response.Result = json.RawMessage(result)
+		response.Result = json.RawMessage(resultJSON)
 	}
 	*reply = response
 	return nil

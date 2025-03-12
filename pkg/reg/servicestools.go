@@ -1,14 +1,20 @@
+// ./pkg/reg/servicestools.go
 package reg
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"go/build"
 	"os"
-	"plugin"
 
+	"github.com/traefik/yaegi/interp"
+	"github.com/traefik/yaegi/stdlib"
+	"github.com/traefik/yaegi/stdlib/unsafe"
 	"gopkg.in/yaml.v2"
 
 	"github.com/santoshkal/gomcp/pkg/mcp"
+	"github.com/santoshkal/gomcp/pkg/plugins"
 )
 
 // Config represents the overall YAML configuration.
@@ -18,64 +24,95 @@ type Config struct {
 
 // ServiceConfig defines a service entry.
 type ServiceConfig struct {
-	Name  string       `yaml:"name"`
-	Tools []ToolConfig `yaml:"tools"`
+	Name    string       `yaml:"name"`
+	Enabled bool         `yaml:"enabled"` // if false, skip this service
+	Tools   []ToolConfig `yaml:"tools"`
 }
 
 // ToolConfig defines an individual tool.
 type ToolConfig struct {
 	Name        string                 `yaml:"name"`
 	Description string                 `yaml:"description"`
+	Enabled     bool                   `yaml:"enabled"` // if false, skip this tool
 	Schema      map[string]interface{} `yaml:"schema"`
-	Plugin      PluginConfig           `yaml:"plugin"`
-}
-
-// PluginConfig holds plugin-specific info.
-type PluginConfig struct {
-	Path   string `yaml:"path"`
-	Symbol string `yaml:"symbol"`
+	Plugin      string                 `yaml:"plugin"` // Inline Go code for the handler.
 }
 
 // loadConfig reads and unmarshals the YAML file.
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("error reading YAML config: %w", err)
+		return nil, fmt.Errorf("failed to read YAML config: %w", err)
 	}
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("error unmarshaling YAML: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal YAML: %w", err)
 	}
 	return &cfg, nil
 }
 
-// RegisterToolsFromConfig loads the configuration from YAML,
-// loads the plugin for each tool, and registers the tool using the mcp.Registry.
+// RegisterToolsFromConfig loads the configuration, evaluates each tool's script using Yaegi,
+// and registers only the enabled tools using the provided Registry.
 func RegisterToolsFromConfig(r mcp.Registry, configPath string) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("failed to load config: %v", err)
+		return err
 	}
 
 	for _, svc := range cfg.Services {
+		if !svc.Enabled {
+			continue
+		}
 		for _, tool := range svc.Tools {
-			p, err := plugin.Open(tool.Plugin.Path)
-			if err != nil {
-				return fmt.Errorf("failed to open plugin %s: %v", tool.Plugin.Path, err)
+			if !tool.Enabled {
+				continue
+			}
+			goPath := build.Default.GOPATH
+			fmt.Printf("GoPath: %v\n", goPath)
+
+			// Create a new yaegi interpreter instance.
+			var stdout, stderr bytes.Buffer
+			i := interp.New(interp.Options{GoPath: goPath, Env: os.Environ(), Stdout: &stdout, Stderr: &stderr})
+			if err := i.Use(stdlib.Symbols); err != nil {
+				fmt.Printf("error loading package symbols: %v\n", err)
+			}
+			if err := i.Use(unsafe.Symbols); err != nil {
+				fmt.Printf("error loading unsafe symbols: %v", err)
 			}
 
-			symbol, err := p.Lookup(tool.Plugin.Symbol)
-			if err != nil {
-				return fmt.Errorf("failed to lookup symbol %s in plugin %s: %v", tool.Plugin.Symbol, tool.Plugin.Path, err)
+			if err := i.Use(plugins.HandlerSymbols()); err != nil {
+				fmt.Printf("error loading handler symbols: %v\n", err)
 			}
 
-			// Assert that the symbol implements the expected type.
-			handler, ok := symbol.(func(context.Context, mcp.Registry, map[string]interface{}) error)
+			// code, err := os.ReadFile(tool.Script)
+			// if err != nil {
+			// 	fmt.Printf("error reading plugin file: %v", err)
+			// }
+
+			// Evaluate the provided script. The script must define a function "Handler".
+			if _, err := i.Eval(fmt.Sprintf(`import "%s"`, tool.Plugin)); err != nil {
+				return fmt.Errorf("failed to evaluate plugin for tool [%s]: %+v", tool.Name, err)
+			}
+
+			// if _, err := i.Eval(string(code)); err != nil {
+			// 	fmt.Printf("error evaluating plugin code: %v", err)
+			// }
+
+			fmt.Printf("Script Path: %v\n ", tool.Plugin)
+
+			// Retrieve the Handler symbol.
+			v, err := i.Eval("Handler")
+			if err != nil {
+				return fmt.Errorf("failed to retrieve Handler symbol for tool %s: %v", tool.Name, err)
+			}
+
+			// Assert that the symbol has the correct signature.
+			handler, ok := v.Interface().(func(context.Context, map[string]interface{}) (interface{}, error))
 			if !ok {
-				return fmt.Errorf("plugin symbol %s in %s does not match expected handler signature", tool.Plugin.Symbol, tool.Plugin.Path)
+				return fmt.Errorf("handler for tool %s does not have the correct signature", tool.Name)
 			}
 
-			// Register the tool using the common registry interface.
+			// Register the tool.
 			r.RegisterTool(tool.Name, tool.Description, tool.Schema, handler)
 		}
 	}
