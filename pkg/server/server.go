@@ -82,9 +82,9 @@ func NewServer() (*Server, error) {
 	}
 
 	// Dynamically load and register tools from YAML configuration.
-	homeDir := os.Getenv("HOME")
-	configPath := homeDir + "/gomcp/plug.yaml"
-	// configPath := "/workspaces/gomcp/plug.yaml"
+	//homeDir := os.Getenv("HOME")
+	//configPath := homeDir + "/gomcp/plug.yaml"
+	configPath := "/workspaces/gomcp/plug.yaml"
 	logger.Infof("Config Path: %v", configPath)
 	if configPath == "" {
 		configPath = "plug.yaml" // Default configuration file.
